@@ -120,14 +120,43 @@
             display: flex;
             align-items: center;
             margin-right: 10px;
+            gap: 5px;
         }
-        .play-button {
+        .control-button {
             background: none;
             border: none;
             font-size: 24px;
             cursor: pointer;
             padding: 0 10px;
             color: #333;
+        }
+        .control-button:hover {
+            color: #4CAF50;
+        }
+        .time-controls {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            margin-left: 10px;
+        }
+        .speed-controls {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            margin-left: auto;
+        }
+        .speed-button {
+            background: none;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            padding: 2px 5px;
+            font-size: 12px;
+            cursor: pointer;
+        }
+        .speed-button.active {
+            background-color: #4CAF50;
+            color: white;
+            border-color: #4CAF50;
         }
     </style>
 </head>
@@ -153,11 +182,18 @@
             <video id="video-player" controls></video>
             <div class="seek-container">
                 <div class="play-controls">
-                    <button class="play-button" id="play-pause-btn">⏵</button>
+                    <button class="control-button" id="rewind-btn">⏪</button>
+                    <button class="control-button" id="play-pause-btn">⏵</button>
+                    <button class="control-button" id="forward-btn">⏩</button>
                 </div>
                 <span class="time-display" id="current-time">00:00:00</span>
                 <input type="range" class="seek-bar" id="seek-bar" min="0" max="100" value="0">
                 <span class="time-display" id="duration">00:00:00</span>
+                <div class="speed-controls">
+                    <button class="speed-button active" data-speed="1">1x</button>
+                    <button class="speed-button" data-speed="1.5">1.5x</button>
+                    <button class="speed-button" data-speed="2">2x</button>
+                </div>
             </div>
             <div class="preview-timeline" id="preview-timeline"></div>
         </div>
@@ -181,6 +217,9 @@
             const errorContainer = document.getElementById('error-container');
             const previewTimeline = document.getElementById('preview-timeline');
             const playPauseBtn = document.getElementById('play-pause-btn');
+            const rewindBtn = document.getElementById('rewind-btn');
+            const forwardBtn = document.getElementById('forward-btn');
+            const speedButtons = document.querySelectorAll('.speed-button');
             
             // Current recordings data
             let recordings = [];
@@ -188,6 +227,9 @@
             let totalDuration = 0;
             let segmentStartTimes = [];
             let isSeeking = false;
+            
+            // Constants
+            const SKIP_TIME = 10; // seconds to skip forward/backward
             
             // Format time for display (HH:MM:SS)
             function formatTime(seconds) {
@@ -232,12 +274,6 @@
                         processRecordings();
                         displayRecordings();
                         createTimeline();
-                        
-                        // If recordings are available, prepare the first one
-                        if (recordings.length > 0) {
-                            currentRecordingIndex = 0;
-                            updateVideoSource(0, 0);
-                        }
                     })
                     .catch(error => {
                         showError(`Error loading recordings: ${error.message}`);
@@ -258,27 +294,6 @@
                 // Update seekbar max value to total duration
                 seekBar.max = totalDuration;
                 durationDisplay.textContent = formatTime(totalDuration);
-            }
-            
-            // Generate a video URL with the proper startTime parameter
-            function generateVideoURL(recordingIndex, offsetTime) {
-                const recording = recordings[recordingIndex];
-                const recordingStartTime = new Date(recording.start);
-                
-                // Add the offset to the recording's start time
-                const adjustedStartTime = new Date(recordingStartTime.getTime() + (offsetTime * 1000));
-                
-                // Format the adjusted time in ISO format for the URL
-                const timeParam = adjustedStartTime.toISOString();
-                
-                // Calculate remaining duration (original duration minus the offset)
-                const remainingDuration = recording.duration - offsetTime;
-                
-                // Create the URL with the adjusted parameters
-                const serverUrl = serverUrlInput.value.trim();
-                const path = pathInput.value.trim();
-                
-                return `${serverUrl}/get?path=${encodeURIComponent(path)}&start=${encodeURIComponent(timeParam)}&duration=${remainingDuration}`;
             }
             
             // Create visual timeline
@@ -356,22 +371,27 @@
                 return null;
             }
             
-            // Update video source with appropriate startTime
-            function updateVideoSource(recordingIndex, offsetTime) {
-                if (recordingIndex < 0 || recordingIndex >= recordings.length) return;
+            // Generate the correct URL for a given recording and offset time
+            function generateVideoURL(index, offsetTime) {
+                if (index < 0 || index >= recordings.length) return null;
                 
-                // Generate URL with correct startTime and duration
-                const videoUrl = generateVideoURL(recordingIndex, offsetTime);
+                const recording = recordings[index];
+                // Calculate the new start time by adding the offset to the original start time
+                const startDate = new Date(recording.start);
+                const offsetMs = offsetTime * 1000; // convert to milliseconds
+                startDate.setTime(startDate.getTime() + offsetMs);
                 
-                // Update video player source
-                videoPlayer.src = videoUrl;
-                videoPlayer.load();
+                // Calculate remaining duration
+                const remainingDuration = Math.max(0, recording.duration - offsetTime);
                 
-                // Update current recording index
-                currentRecordingIndex = recordingIndex;
+                // Format the start time for URL
+                const startTimeParam = encodeURIComponent(startDate.toISOString());
                 
-                // Highlight the current segment
-                highlightCurrentSegment(recordingIndex);
+                // Build the URL
+                const serverUrl = serverUrlInput.value.trim();
+                const path = pathInput.value.trim();
+                
+                return `${serverUrl}/get?path=${encodeURIComponent(path)}&start=${startTimeParam}&duration=${remainingDuration}`;
             }
             
             // Seek to a specific global time across all recordings
@@ -382,18 +402,28 @@
                 
                 isSeeking = true;
                 
-                // Update video source if we're changing recordings
                 if (position.index !== currentRecordingIndex) {
-                    updateVideoSource(position.index, position.localTime);
+                    // Playing a different recording
+                    currentRecordingIndex = position.index;
                     
-                    // Set play state after video loads
+                    // Generate URL with the correct start time
+                    const url = generateVideoURL(position.index, position.localTime);
+                    if (!url) return;
+                    
+                    // Update video source
+                    videoPlayer.src = url;
+                    videoPlayer.load();
+                    
+                    // Play once loaded
                     videoPlayer.addEventListener('loadedmetadata', function onLoaded() {
+                        videoPlayer.currentTime = 0; // Start from beginning since URL has offset
                         videoPlayer.play();
-                        isSeeking = false;
+                        updatePlayPauseButton();
                         videoPlayer.removeEventListener('loadedmetadata', onLoaded);
+                        isSeeking = false;
                     });
                 } else {
-                    // We're in the same recording, just update the current time
+                    // Same recording, just seek within it
                     videoPlayer.currentTime = position.localTime;
                     isSeeking = false;
                 }
@@ -402,8 +432,17 @@
                 seekBar.value = globalTime;
                 currentTimeDisplay.textContent = formatTime(globalTime);
                 
-                // Update play state
-                updatePlayPauseButton();
+                highlightCurrentSegment(position.index);
+            }
+            
+            // Skip forward or backward
+            function skipTime(seconds) {
+                if (currentRecordingIndex < 0) return;
+                
+                const currentGlobalTime = segmentStartTimes[currentRecordingIndex] + videoPlayer.currentTime;
+                const newTime = Math.max(0, Math.min(totalDuration, currentGlobalTime + seconds));
+                
+                seekToGlobalTime(newTime);
             }
             
             // Highlight the current segment in the timeline
@@ -435,6 +474,20 @@
                 playPauseBtn.textContent = videoPlayer.paused ? '⏵' : '⏸';
             }
             
+            // Set playback speed
+            function setPlaybackSpeed(speed) {
+                videoPlayer.playbackRate = speed;
+                
+                // Update UI
+                speedButtons.forEach(btn => {
+                    if (parseFloat(btn.dataset.speed) === speed) {
+                        btn.classList.add('active');
+                    } else {
+                        btn.classList.remove('active');
+                    }
+                });
+            }
+            
             // Handle video time update
             function handleTimeUpdate() {
                 if (currentRecordingIndex < 0 || isSeeking) return;
@@ -451,10 +504,33 @@
                     if (currentRecordingIndex < recordings.length - 1) {
                         // Move to next recording
                         const nextIndex = currentRecordingIndex + 1;
-                        updateVideoSource(nextIndex, 0);
-                        videoPlayer.play();
+                        currentRecordingIndex = nextIndex;
+                        
+                        const url = generateVideoURL(nextIndex, 0);
+                        if (url) {
+                            videoPlayer.src = url;
+                            videoPlayer.load();
+                            videoPlayer.play();
+                            highlightCurrentSegment(nextIndex);
+                        }
                     }
                 }
+            }
+            
+            // Play the first recording
+            function playFirstRecording() {
+                if (recordings.length === 0) return;
+                
+                currentRecordingIndex = 0;
+                const url = generateVideoURL(0, 0);
+                if (!url) return;
+                
+                videoPlayer.src = url;
+                videoPlayer.load();
+                videoPlayer.play();
+                
+                highlightCurrentSegment(0);
+                updatePlayPauseButton();
             }
             
             // Show error message
@@ -474,7 +550,6 @@
             
             // Video player events
             videoPlayer.addEventListener('timeupdate', handleTimeUpdate);
-            
             videoPlayer.addEventListener('play', updatePlayPauseButton);
             videoPlayer.addEventListener('pause', updatePlayPauseButton);
             
@@ -487,9 +562,7 @@
             // Play/Pause button
             playPauseBtn.addEventListener('click', function() {
                 if (currentRecordingIndex < 0 && recordings.length > 0) {
-                    // Start playing the first recording
-                    updateVideoSource(0, 0);
-                    videoPlayer.play();
+                    playFirstRecording();
                 } else if (videoPlayer.paused) {
                     videoPlayer.play();
                 } else {
@@ -498,13 +571,29 @@
                 updatePlayPauseButton();
             });
             
+            // Forward/Rewind buttons
+            forwardBtn.addEventListener('click', function() {
+                skipTime(SKIP_TIME);
+            });
+            
+            rewindBtn.addEventListener('click', function() {
+                skipTime(-SKIP_TIME);
+            });
+            
+            // Speed buttons
+            speedButtons.forEach(btn => {
+                btn.addEventListener('click', function() {
+                    const speed = parseFloat(this.dataset.speed);
+                    setPlaybackSpeed(speed);
+                });
+            });
+            
             // Handle keyboard shortcuts
             document.addEventListener('keydown', function(e) {
                 if (e.code === 'Space') {
                     e.preventDefault();
                     if (currentRecordingIndex < 0 && recordings.length > 0) {
-                        updateVideoSource(0, 0);
-                        videoPlayer.play();
+                        playFirstRecording();
                     } else if (videoPlayer.paused) {
                         videoPlayer.play();
                     } else {
@@ -512,11 +601,9 @@
                     }
                     updatePlayPauseButton();
                 } else if (e.code === 'ArrowRight') {
-                    const globalTime = parseFloat(seekBar.value) + 10;
-                    seekToGlobalTime(Math.min(globalTime, totalDuration));
+                    skipTime(SKIP_TIME);
                 } else if (e.code === 'ArrowLeft') {
-                    const globalTime = parseFloat(seekBar.value) - 10;
-                    seekToGlobalTime(Math.max(globalTime, 0));
+                    skipTime(-SKIP_TIME);
                 } else if (e.code === 'ArrowUp') {
                     videoPlayer.volume = Math.min(1, videoPlayer.volume + 0.1);
                 } else if (e.code === 'ArrowDown') {
