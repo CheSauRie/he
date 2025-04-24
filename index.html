@@ -11,6 +11,7 @@
             padding: 20px;
             max-width: 1200px;
             margin: 0 auto;
+            background-color: #f5f5f5;
         }
         h1 {
             color: #333;
@@ -44,6 +45,9 @@
             position: relative;
             width: 100%;
             background-color: #000;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
         }
         video {
             width: 100%;
@@ -54,16 +58,23 @@
             display: flex;
             align-items: center;
             gap: 10px;
-            margin-top: 10px;
+            padding: 10px;
+            background-color: #f8f8f8;
+            border-bottom-left-radius: 8px;
+            border-bottom-right-radius: 8px;
         }
         .seek-bar {
             flex-grow: 1;
+            height: 6px;
+            cursor: pointer;
         }
         .recordings-list {
             max-height: 300px;
             overflow-y: auto;
             border: 1px solid #ddd;
             padding: 10px;
+            border-radius: 8px;
+            background-color: white;
         }
         .recording-item {
             padding: 10px;
@@ -75,21 +86,48 @@
         }
         .time-display {
             font-family: monospace;
-            min-width: 100px;
-        }
-        .date-controls {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-            margin-bottom: 10px;
+            min-width: 60px;
+            color: #555;
         }
         .error {
             color: red;
             font-weight: bold;
+            padding: 10px;
+            background-color: #fff0f0;
+            border-radius: 4px;
+            margin-bottom: 10px;
         }
         .loading {
             text-align: center;
             padding: 20px;
+            color: #666;
+        }
+        .preview-timeline {
+            position: relative;
+            height: 20px;
+            background-color: #e0e0e0;
+            margin-top: 5px;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        .timeline-segment {
+            position: absolute;
+            height: 100%;
+            background-color: #2196F3;
+            opacity: 0.7;
+        }
+        .play-controls {
+            display: flex;
+            align-items: center;
+            margin-right: 10px;
+        }
+        .play-button {
+            background: none;
+            border: none;
+            font-size: 24px;
+            cursor: pointer;
+            padding: 0 10px;
+            color: #333;
         }
     </style>
 </head>
@@ -109,30 +147,23 @@
             <button id="load-btn">Load Recordings</button>
         </div>
         
-        <div class="date-controls">
-            <div>
-                <label for="start-date">Start Date:</label>
-                <input type="datetime-local" id="start-date">
-            </div>
-            <div>
-                <label for="end-date">End Date:</label>
-                <input type="datetime-local" id="end-date">
-            </div>
-        </div>
-        
-        <div id="error-container" class="error"></div>
-        
-        <div class="recordings-list" id="recordings-list">
-            <div class="loading">Enter a path and click "Load Recordings" to begin</div>
-        </div>
+        <div id="error-container" class="error" style="display: none;"></div>
         
         <div class="video-container">
             <video id="video-player" controls></video>
             <div class="seek-container">
+                <div class="play-controls">
+                    <button class="play-button" id="play-pause-btn">⏵</button>
+                </div>
                 <span class="time-display" id="current-time">00:00:00</span>
                 <input type="range" class="seek-bar" id="seek-bar" min="0" max="100" value="0">
                 <span class="time-display" id="duration">00:00:00</span>
             </div>
+            <div class="preview-timeline" id="preview-timeline"></div>
+        </div>
+        
+        <div class="recordings-list" id="recordings-list">
+            <div class="loading">Enter a path and click "Load Recordings" to begin</div>
         </div>
     </div>
 
@@ -142,34 +173,24 @@
             const serverUrlInput = document.getElementById('server-url');
             const pathInput = document.getElementById('path-input');
             const loadBtn = document.getElementById('load-btn');
-            const startDateInput = document.getElementById('start-date');
-            const endDateInput = document.getElementById('end-date');
             const recordingsList = document.getElementById('recordings-list');
             const videoPlayer = document.getElementById('video-player');
             const seekBar = document.getElementById('seek-bar');
             const currentTimeDisplay = document.getElementById('current-time');
             const durationDisplay = document.getElementById('duration');
             const errorContainer = document.getElementById('error-container');
-            
-            // Set default dates (today and yesterday)
-            const now = new Date();
-            const yesterday = new Date(now);
-            yesterday.setDate(yesterday.getDate() - 1);
-            
-            // Format for datetime-local input (YYYY-MM-DDThh:mm)
-            function formatDateForInput(date) {
-                return date.toISOString().slice(0, 16);
-            }
-            
-            startDateInput.value = formatDateForInput(yesterday);
-            endDateInput.value = formatDateForInput(now);
+            const previewTimeline = document.getElementById('preview-timeline');
+            const playPauseBtn = document.getElementById('play-pause-btn');
             
             // Current recordings data
             let recordings = [];
             let currentRecordingIndex = -1;
+            let totalDuration = 0;
+            let segmentStartTimes = [];
             
             // Format time for display (HH:MM:SS)
             function formatTime(seconds) {
+                seconds = Math.max(0, seconds);
                 const h = Math.floor(seconds / 3600);
                 const m = Math.floor((seconds % 3600) / 60);
                 const s = Math.floor(seconds % 60);
@@ -195,14 +216,8 @@
                 clearError();
                 recordingsList.innerHTML = '<div class="loading">Loading recordings...</div>';
                 
-                // Format dates for RFC3339
-                const startDate = startDateInput.value ? new Date(startDateInput.value).toISOString() : '';
-                const endDate = endDateInput.value ? new Date(endDateInput.value).toISOString() : '';
-                
-                // Build the URL
+                // Build the URL - without date filtering
                 let listUrl = `${serverUrl}/list?path=${encodeURIComponent(path)}`;
-                if (startDate) listUrl += `&start=${encodeURIComponent(startDate)}`;
-                if (endDate) listUrl += `&end=${encodeURIComponent(endDate)}`;
                 
                 fetch(listUrl)
                     .then(response => {
@@ -213,7 +228,9 @@
                     })
                     .then(data => {
                         recordings = data;
+                        processRecordings();
                         displayRecordings();
+                        createTimeline();
                     })
                     .catch(error => {
                         showError(`Error loading recordings: ${error.message}`);
@@ -221,10 +238,47 @@
                     });
             }
             
+            // Process recordings to calculate total duration and start times
+            function processRecordings() {
+                totalDuration = 0;
+                segmentStartTimes = [];
+                
+                recordings.forEach(recording => {
+                    segmentStartTimes.push(totalDuration);
+                    totalDuration += recording.duration;
+                });
+                
+                // Update seekbar max value to total duration
+                seekBar.max = totalDuration;
+                durationDisplay.textContent = formatTime(totalDuration);
+            }
+            
+            // Create visual timeline
+            function createTimeline() {
+                previewTimeline.innerHTML = '';
+                
+                recordings.forEach((recording, index) => {
+                    const startPercent = (segmentStartTimes[index] / totalDuration) * 100;
+                    const widthPercent = (recording.duration / totalDuration) * 100;
+                    
+                    const segment = document.createElement('div');
+                    segment.className = 'timeline-segment';
+                    segment.style.left = `${startPercent}%`;
+                    segment.style.width = `${widthPercent}%`;
+                    segment.title = `Recording ${index + 1}: ${formatDate(recording.start)}`;
+                    
+                    segment.addEventListener('click', () => {
+                        seekToGlobalTime(segmentStartTimes[index]);
+                    });
+                    
+                    previewTimeline.appendChild(segment);
+                });
+            }
+            
             // Display recordings list
             function displayRecordings() {
                 if (recordings.length === 0) {
-                    recordingsList.innerHTML = '<div>No recordings found for the specified period</div>';
+                    recordingsList.innerHTML = '<div>No recordings found</div>';
                     return;
                 }
                 
@@ -236,17 +290,64 @@
                     const duration = formatTime(recording.duration);
                     
                     item.innerHTML = `
+                        <div><strong>Recording ${index + 1}</strong></div>
                         <div><strong>Start:</strong> ${startTime}</div>
                         <div><strong>Duration:</strong> ${duration}</div>
                     `;
                     
-                    item.addEventListener('click', () => playRecording(index));
+                    item.addEventListener('click', () => {
+                        seekToGlobalTime(segmentStartTimes[index]);
+                    });
                     recordingsList.appendChild(item);
                 });
             }
             
+            // Find which recording contains a given global time
+            function findRecordingAtTime(globalTime) {
+                for (let i = 0; i < recordings.length; i++) {
+                    const startTime = segmentStartTimes[i];
+                    const endTime = startTime + recordings[i].duration;
+                    
+                    if (globalTime >= startTime && globalTime < endTime) {
+                        return {
+                            index: i,
+                            localTime: globalTime - startTime
+                        };
+                    }
+                }
+                
+                // If we're at the very end, return the last recording
+                if (globalTime >= totalDuration && recordings.length > 0) {
+                    const lastIndex = recordings.length - 1;
+                    return {
+                        index: lastIndex,
+                        localTime: recordings[lastIndex].duration
+                    };
+                }
+                
+                return null;
+            }
+            
+            // Seek to a specific global time across all recordings
+            function seekToGlobalTime(globalTime) {
+                const position = findRecordingAtTime(globalTime);
+                
+                if (!position) return;
+                
+                if (position.index !== currentRecordingIndex) {
+                    playRecording(position.index, position.localTime);
+                } else {
+                    videoPlayer.currentTime = position.localTime;
+                }
+                
+                seekBar.value = globalTime;
+                currentTimeDisplay.textContent = formatTime(globalTime);
+                
+                highlightCurrentSegment(position.index);
+            }
+            
             // Play a recording
-            function playRecording(index) {
+            function playRecording(index, startTime = 0) {
                 if (index < 0 || index >= recordings.length) return;
                 
                 currentRecordingIndex = index;
@@ -255,17 +356,32 @@
                 // Update video source
                 videoPlayer.src = recording.url;
                 videoPlayer.load();
-                videoPlayer.play();
                 
-                // Update seekbar max value to recording duration in seconds
-                seekBar.max = recording.duration;
-                seekBar.value = 0;
+                // Set the start time and play
+                videoPlayer.addEventListener('loadedmetadata', function onLoaded() {
+                    videoPlayer.currentTime = startTime;
+                    videoPlayer.play();
+                    videoPlayer.removeEventListener('loadedmetadata', onLoaded);
+                    updatePlayPauseButton();
+                });
                 
-                // Update duration display
-                durationDisplay.textContent = formatTime(recording.duration);
-                currentTimeDisplay.textContent = formatTime(0);
+                highlightCurrentSegment(index);
+            }
+            
+            // Highlight the current segment in the timeline
+            function highlightCurrentSegment(index) {
+                const segments = previewTimeline.querySelectorAll('.timeline-segment');
+                segments.forEach((segment, i) => {
+                    if (i === index) {
+                        segment.style.backgroundColor = '#FF5722';
+                        segment.style.opacity = '1';
+                    } else {
+                        segment.style.backgroundColor = '#2196F3';
+                        segment.style.opacity = '0.7';
+                    }
+                });
                 
-                // Highlight selected recording
+                // Highlight in the list too
                 const items = recordingsList.querySelectorAll('.recording-item');
                 items.forEach((item, i) => {
                     if (i === index) {
@@ -274,6 +390,31 @@
                         item.style.backgroundColor = '';
                     }
                 });
+            }
+            
+            // Update play/pause button state
+            function updatePlayPauseButton() {
+                playPauseBtn.textContent = videoPlayer.paused ? '⏵' : '⏸';
+            }
+            
+            // Handle video time update
+            function handleTimeUpdate() {
+                if (currentRecordingIndex < 0) return;
+                
+                const localTime = videoPlayer.currentTime;
+                const globalTime = segmentStartTimes[currentRecordingIndex] + localTime;
+                
+                // Update seekbar
+                seekBar.value = globalTime;
+                currentTimeDisplay.textContent = formatTime(globalTime);
+                
+                // Check if we need to switch to the next recording
+                if (localTime >= recordings[currentRecordingIndex].duration - 0.1) {
+                    if (currentRecordingIndex < recordings.length - 1) {
+                        // Move to next recording
+                        playRecording(currentRecordingIndex + 1);
+                    }
+                }
             }
             
             // Show error message
@@ -292,45 +433,48 @@
             loadBtn.addEventListener('click', loadRecordings);
             
             // Video player events
-            videoPlayer.addEventListener('timeupdate', function() {
-                const currentTime = videoPlayer.currentTime;
-                seekBar.value = currentTime;
-                currentTimeDisplay.textContent = formatTime(currentTime);
-            });
+            videoPlayer.addEventListener('timeupdate', handleTimeUpdate);
             
+            videoPlayer.addEventListener('play', updatePlayPauseButton);
+            videoPlayer.addEventListener('pause', updatePlayPauseButton);
+            
+            // Seekbar event
             seekBar.addEventListener('input', function() {
-                const seekTime = parseFloat(seekBar.value);
-                if (!isNaN(seekTime)) {
-                    videoPlayer.currentTime = seekTime;
-                    currentTimeDisplay.textContent = formatTime(seekTime);
-                }
+                const globalTime = parseFloat(seekBar.value);
+                seekToGlobalTime(globalTime);
             });
             
-            videoPlayer.addEventListener('loadedmetadata', function() {
-                seekBar.max = videoPlayer.duration;
-                durationDisplay.textContent = formatTime(videoPlayer.duration);
-            });
-            
-            videoPlayer.addEventListener('ended', function() {
-                // Auto-play next recording if available
-                if (currentRecordingIndex < recordings.length - 1) {
-                    playRecording(currentRecordingIndex + 1);
+            // Play/Pause button
+            playPauseBtn.addEventListener('click', function() {
+                if (currentRecordingIndex < 0 && recordings.length > 0) {
+                    // Start playing the first recording
+                    playRecording(0);
+                } else if (videoPlayer.paused) {
+                    videoPlayer.play();
+                } else {
+                    videoPlayer.pause();
                 }
+                updatePlayPauseButton();
             });
             
             // Handle keyboard shortcuts
             document.addEventListener('keydown', function(e) {
                 if (e.code === 'Space') {
                     e.preventDefault();
-                    if (videoPlayer.paused) {
+                    if (currentRecordingIndex < 0 && recordings.length > 0) {
+                        playRecording(0);
+                    } else if (videoPlayer.paused) {
                         videoPlayer.play();
                     } else {
                         videoPlayer.pause();
                     }
+                    updatePlayPauseButton();
                 } else if (e.code === 'ArrowRight') {
-                    videoPlayer.currentTime += 10; // Skip forward 10 seconds
+                    const globalTime = parseFloat(seekBar.value) + 10;
+                    seekToGlobalTime(Math.min(globalTime, totalDuration));
                 } else if (e.code === 'ArrowLeft') {
-                    videoPlayer.currentTime -= 10; // Skip backward 10 seconds
+                    const globalTime = parseFloat(seekBar.value) - 10;
+                    seekToGlobalTime(Math.max(globalTime, 0));
                 } else if (e.code === 'ArrowUp') {
                     videoPlayer.volume = Math.min(1, videoPlayer.volume + 0.1);
                 } else if (e.code === 'ArrowDown') {
