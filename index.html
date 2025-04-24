@@ -187,6 +187,7 @@
             let currentRecordingIndex = -1;
             let totalDuration = 0;
             let segmentStartTimes = [];
+            let isSeeking = false;
             
             // Format time for display (HH:MM:SS)
             function formatTime(seconds) {
@@ -231,6 +232,12 @@
                         processRecordings();
                         displayRecordings();
                         createTimeline();
+                        
+                        // If recordings are available, prepare the first one
+                        if (recordings.length > 0) {
+                            currentRecordingIndex = 0;
+                            updateVideoSource(0, 0);
+                        }
                     })
                     .catch(error => {
                         showError(`Error loading recordings: ${error.message}`);
@@ -251,6 +258,27 @@
                 // Update seekbar max value to total duration
                 seekBar.max = totalDuration;
                 durationDisplay.textContent = formatTime(totalDuration);
+            }
+            
+            // Generate a video URL with the proper startTime parameter
+            function generateVideoURL(recordingIndex, offsetTime) {
+                const recording = recordings[recordingIndex];
+                const recordingStartTime = new Date(recording.start);
+                
+                // Add the offset to the recording's start time
+                const adjustedStartTime = new Date(recordingStartTime.getTime() + (offsetTime * 1000));
+                
+                // Format the adjusted time in ISO format for the URL
+                const timeParam = adjustedStartTime.toISOString();
+                
+                // Calculate remaining duration (original duration minus the offset)
+                const remainingDuration = recording.duration - offsetTime;
+                
+                // Create the URL with the adjusted parameters
+                const serverUrl = serverUrlInput.value.trim();
+                const path = pathInput.value.trim();
+                
+                return `${serverUrl}/get?path=${encodeURIComponent(path)}&start=${encodeURIComponent(timeParam)}&duration=${remainingDuration}`;
             }
             
             // Create visual timeline
@@ -328,44 +356,54 @@
                 return null;
             }
             
+            // Update video source with appropriate startTime
+            function updateVideoSource(recordingIndex, offsetTime) {
+                if (recordingIndex < 0 || recordingIndex >= recordings.length) return;
+                
+                // Generate URL with correct startTime and duration
+                const videoUrl = generateVideoURL(recordingIndex, offsetTime);
+                
+                // Update video player source
+                videoPlayer.src = videoUrl;
+                videoPlayer.load();
+                
+                // Update current recording index
+                currentRecordingIndex = recordingIndex;
+                
+                // Highlight the current segment
+                highlightCurrentSegment(recordingIndex);
+            }
+            
             // Seek to a specific global time across all recordings
             function seekToGlobalTime(globalTime) {
                 const position = findRecordingAtTime(globalTime);
                 
                 if (!position) return;
                 
+                isSeeking = true;
+                
+                // Update video source if we're changing recordings
                 if (position.index !== currentRecordingIndex) {
-                    playRecording(position.index, position.localTime);
+                    updateVideoSource(position.index, position.localTime);
+                    
+                    // Set play state after video loads
+                    videoPlayer.addEventListener('loadedmetadata', function onLoaded() {
+                        videoPlayer.play();
+                        isSeeking = false;
+                        videoPlayer.removeEventListener('loadedmetadata', onLoaded);
+                    });
                 } else {
+                    // We're in the same recording, just update the current time
                     videoPlayer.currentTime = position.localTime;
+                    isSeeking = false;
                 }
                 
+                // Update UI elements
                 seekBar.value = globalTime;
                 currentTimeDisplay.textContent = formatTime(globalTime);
                 
-                highlightCurrentSegment(position.index);
-            }
-            
-            // Play a recording
-            function playRecording(index, startTime = 0) {
-                if (index < 0 || index >= recordings.length) return;
-                
-                currentRecordingIndex = index;
-                const recording = recordings[index];
-                
-                // Update video source
-                videoPlayer.src = recording.url;
-                videoPlayer.load();
-                
-                // Set the start time and play
-                videoPlayer.addEventListener('loadedmetadata', function onLoaded() {
-                    videoPlayer.currentTime = startTime;
-                    videoPlayer.play();
-                    videoPlayer.removeEventListener('loadedmetadata', onLoaded);
-                    updatePlayPauseButton();
-                });
-                
-                highlightCurrentSegment(index);
+                // Update play state
+                updatePlayPauseButton();
             }
             
             // Highlight the current segment in the timeline
@@ -399,20 +437,22 @@
             
             // Handle video time update
             function handleTimeUpdate() {
-                if (currentRecordingIndex < 0) return;
+                if (currentRecordingIndex < 0 || isSeeking) return;
                 
                 const localTime = videoPlayer.currentTime;
                 const globalTime = segmentStartTimes[currentRecordingIndex] + localTime;
                 
-                // Update seekbar
+                // Update seekbar without triggering the input event
                 seekBar.value = globalTime;
                 currentTimeDisplay.textContent = formatTime(globalTime);
                 
                 // Check if we need to switch to the next recording
-                if (localTime >= recordings[currentRecordingIndex].duration - 0.1) {
+                if (localTime >= recordings[currentRecordingIndex].duration - 0.5) {
                     if (currentRecordingIndex < recordings.length - 1) {
                         // Move to next recording
-                        playRecording(currentRecordingIndex + 1);
+                        const nextIndex = currentRecordingIndex + 1;
+                        updateVideoSource(nextIndex, 0);
+                        videoPlayer.play();
                     }
                 }
             }
@@ -448,7 +488,8 @@
             playPauseBtn.addEventListener('click', function() {
                 if (currentRecordingIndex < 0 && recordings.length > 0) {
                     // Start playing the first recording
-                    playRecording(0);
+                    updateVideoSource(0, 0);
+                    videoPlayer.play();
                 } else if (videoPlayer.paused) {
                     videoPlayer.play();
                 } else {
@@ -462,7 +503,8 @@
                 if (e.code === 'Space') {
                     e.preventDefault();
                     if (currentRecordingIndex < 0 && recordings.length > 0) {
-                        playRecording(0);
+                        updateVideoSource(0, 0);
+                        videoPlayer.play();
                     } else if (videoPlayer.paused) {
                         videoPlayer.play();
                     } else {
