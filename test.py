@@ -1,20 +1,15 @@
-# Simple AI Video Upscaler Service
+# Simple Video Upscaler Service using only OpenCV
 # Required installations:
-# pip install flask torch numpy opencv-python pillow moviepy basicsr facexlib gfpgan realesrgan
+# pip install flask opencv-python numpy
 
 import os
 import uuid
 import time
 from flask import Flask, request, jsonify, render_template, send_from_directory
-import torch
 from threading import Thread
 from queue import Queue
-import subprocess
 import cv2
 import numpy as np
-from moviepy.editor import VideoFileClip
-from realesrgan import RealESRGANer
-from basicsr.archs.rrdbnet_arch import RRDBNet
 
 app = Flask(__name__)
 
@@ -35,21 +30,6 @@ job_status = {}  # Dictionary to track job status
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-# Initialize AI model (only when needed)
-def get_upscaler():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32)
-    upscaler = RealESRGANer(
-        scale=2,
-        model_path='https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth',
-        model=model,
-        tile=400,
-        tile_pad=10,
-        pre_pad=0,
-        device=device
-    )
-    return upscaler
-
 # Worker function for processing videos
 def process_worker():
     while True:
@@ -61,133 +41,61 @@ def process_worker():
             job_status[job_id]['progress'] = 10
             
             # Extract video information
-            clip = VideoFileClip(input_path)
-            original_width, original_height = clip.size
-            clip.close()
+            video = cv2.VideoCapture(input_path)
+            original_width = int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
+            original_height = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            original_fps = video.get(cv2.CAP_PROP_FPS)
+            total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+            video.release()  # Close video to reopen it later
             
             # Parse target resolution
             if target_resolution == '720p':
                 target_height = 720
                 target_width = int((target_height / original_height) * original_width)
-                target_width = target_width - (target_width % 2)  # Ensure even width
+                # Ensure even dimensions (required by some codecs)
+                target_width = target_width - (target_width % 2)
+            elif target_resolution == '1080p':
+                target_height = 1080
+                target_width = int((target_height / original_height) * original_width)
+                target_width = target_width - (target_width % 2)
+            elif target_resolution == '4k':
+                target_height = 2160
+                target_width = int((target_height / original_height) * original_width)
+                target_width = target_width - (target_width % 2)
             else:
                 # Default to 720p if invalid
                 target_height = 720
                 target_width = int((target_height / original_height) * original_width)
                 target_width = target_width - (target_width % 2)
-                
+            
             # Update status
             job_status[job_id]['progress'] = 20
             
-            # Process the video using AI upscaling and frame interpolation
-            if torch.cuda.is_available():
-                # GPU available - use AI upscaling
-                upscale_with_ai(input_path, output_path, target_width, target_height, target_fps, job_id)
-            else:
-                # CPU only - use OpenCV for basic upscaling
-                upscale_with_opencv(input_path, output_path, target_width, target_height, target_fps, job_id)
-                
+            # Process video using OpenCV for basic upscaling
+            upscale_with_opencv(input_path, output_path, target_width, target_height, target_fps, job_id)
+            
             job_status[job_id]['status'] = 'completed'
             job_status[job_id]['progress'] = 100
             
         except Exception as e:
             job_status[job_id]['status'] = 'failed'
             job_status[job_id]['error'] = str(e)
+            print(f"Error processing job {job_id}: {str(e)}")
         finally:
             job_queue.task_done()
 
-# AI-based upscaling function
-def upscale_with_ai(input_path, output_path, target_width, target_height, target_fps, job_id):
-    # Extract frames to temporary folder
-    temp_folder = f"temp_{job_id}"
-    os.makedirs(temp_folder, exist_ok=True)
-    
-    video = cv2.VideoCapture(input_path)
-    fps = video.get(cv2.CAP_PROP_FPS)
-    total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    # Extract frames
-    count = 0
-    job_status[job_id]['progress'] = 30
-    
-    while True:
-        ret, frame = video.read()
-        if not ret:
-            break
-        
-        # Save the frame to the temporary folder
-        cv2.imwrite(f"{temp_folder}/frame_{count:06d}.png", frame)
-        count += 1
-        
-        # Update progress periodically
-        if count % 10 == 0:
-            progress = min(50, 30 + int((count / total_frames) * 20))
-            job_status[job_id]['progress'] = progress
-    
-    video.release()
-    
-    # Process frames with RealESRGAN
-    job_status[job_id]['progress'] = 50
-    upscaler = get_upscaler()
-    
-    upscaled_folder = f"upscaled_{job_id}"
-    os.makedirs(upscaled_folder, exist_ok=True)
-    
-    frame_files = sorted(os.listdir(temp_folder))
-    total_frames = len(frame_files)
-    
-    for i, frame_file in enumerate(frame_files):
-        input_frame = cv2.imread(f"{temp_folder}/{frame_file}")
-        upscaled, _ = upscaler.enhance(input_frame, outscale=2)
-        
-        # Resize to target resolution if needed
-        upscaled = cv2.resize(upscaled, (target_width, target_height))
-        
-        # Save upscaled frame
-        cv2.imwrite(f"{upscaled_folder}/{frame_file}", upscaled)
-        
-        # Update progress periodically
-        if i % 10 == 0:
-            progress = min(80, 50 + int((i / total_frames) * 30))
-            job_status[job_id]['progress'] = progress
-    
-    # Combine frames back into video
-    job_status[job_id]['progress'] = 80
-    
-    # Use FFmpeg to combine frames with the target framerate
-    output_fps = target_fps if target_fps else fps
-    ffmpeg_cmd = [
-        'ffmpeg',
-        '-y',  # Overwrite output file if it exists
-        '-framerate', str(output_fps),
-        '-i', f"{upscaled_folder}/frame_%06d.png",
-        '-c:v', 'libx264',
-        '-pix_fmt', 'yuv420p',
-        '-crf', '18',  # Quality setting (0-51, lower is better)
-        output_path
-    ]
-    
-    subprocess.run(ffmpeg_cmd)
-    
-    # Cleanup temporary folders
-    import shutil
-    shutil.rmtree(temp_folder, ignore_errors=True)
-    shutil.rmtree(upscaled_folder, ignore_errors=True)
-    
-    job_status[job_id]['progress'] = 95
-
-# OpenCV-based upscaling for systems without GPU
+# OpenCV-based upscaling
 def upscale_with_opencv(input_path, output_path, target_width, target_height, target_fps, job_id):
     # Open the video
     video = cv2.VideoCapture(input_path)
-    fps = video.get(cv2.CAP_PROP_FPS)
+    original_fps = video.get(cv2.CAP_PROP_FPS)
     total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
     
     # Set the target FPS
-    output_fps = target_fps if target_fps else fps
+    output_fps = target_fps if target_fps else original_fps
     
     # Create VideoWriter object
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # codec
     out = cv2.VideoWriter(output_path, fourcc, output_fps, (target_width, target_height))
     
     count = 0
@@ -196,7 +104,7 @@ def upscale_with_opencv(input_path, output_path, target_width, target_height, ta
         if not ret:
             break
             
-        # Resize frame to target resolution
+        # Resize frame to target resolution using Lanczos interpolation for better quality
         resized_frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_LANCZOS4)
         
         # Write the frame to output video
@@ -205,15 +113,19 @@ def upscale_with_opencv(input_path, output_path, target_width, target_height, ta
         count += 1
         
         # Update progress periodically
-        if count % 30 == 0:
-            progress = min(90, 30 + int((count / total_frames) * 60))
+        if count % 30 == 0 or count == total_frames:
+            progress = min(90, 20 + int((count / total_frames) * 70))
             job_status[job_id]['progress'] = progress
     
     # Release resources
     video.release()
     out.release()
     
+    # Final processing (convert to mp4 with H.264 codec if needed)
     job_status[job_id]['progress'] = 95
+    
+    # If system has ffmpeg installed, we could use it here for better quality encoding
+    # But we'll keep it simple for now with just OpenCV
 
 # Start the worker thread
 worker_thread = Thread(target=process_worker, daemon=True)
@@ -304,7 +216,7 @@ def serve_template():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>AI Video Upscaler</title>
+        <title>Video Upscaler</title>
         <style>
             body {
                 font-family: Arial, sans-serif;
@@ -360,7 +272,7 @@ def serve_template():
         </style>
     </head>
     <body>
-        <h1>AI Video Upscaler</h1>
+        <h1>Video Upscaler</h1>
         
         <div class="container">
             <h2>Upload Your Video</h2>
@@ -373,8 +285,8 @@ def serve_template():
                     <label for="resolution">Target Resolution:</label>
                     <select id="resolution" name="resolution">
                         <option value="720p">720p</option>
-                        <option value="1080p">1080p (Premium)</option>
-                        <option value="4k">4K (Premium)</option>
+                        <option value="1080p">1080p</option>
+                        <option value="4k">4K</option>
                     </select>
                 </div>
                 <div>
