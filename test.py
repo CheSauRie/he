@@ -1,10 +1,12 @@
-# Simple Video Upscaler Service using only OpenCV
+# Video Upscaler Service using OpenCV and FFmpeg
 # Required installations:
 # pip install flask opencv-python numpy
+# FFmpeg must be installed on your system
 
 import os
 import uuid
 import time
+import subprocess
 from flask import Flask, request, jsonify, render_template, send_from_directory
 from threading import Thread
 from queue import Queue
@@ -16,12 +18,14 @@ app = Flask(__name__)
 # Configuration
 UPLOAD_FOLDER = 'uploads'
 PROCESSED_FOLDER = 'processed'
+TEMP_FOLDER = 'temp'
 ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv', 'webm'}
 MAX_QUEUE_SIZE = 10
 
 # Ensure directories exist
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(PROCESSED_FOLDER, exist_ok=True)
+os.makedirs(TEMP_FOLDER, exist_ok=True)
 
 # Job queue and status tracking
 job_queue = Queue(maxsize=MAX_QUEUE_SIZE)
@@ -29,6 +33,14 @@ job_status = {}  # Dictionary to track job status
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+# Check if FFmpeg is installed
+def check_ffmpeg():
+    try:
+        result = subprocess.run(['ffmpeg', '-version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
 
 # Worker function for processing videos
 def process_worker():
@@ -45,34 +57,37 @@ def process_worker():
             original_width = int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
             original_height = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
             original_fps = video.get(cv2.CAP_PROP_FPS)
-            total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
-            video.release()  # Close video to reopen it later
+            video.release()  # Close video
             
             # Parse target resolution
             if target_resolution == '720p':
                 target_height = 720
-                target_width = int((target_height / original_height) * original_width)
-                # Ensure even dimensions (required by some codecs)
-                target_width = target_width - (target_width % 2)
             elif target_resolution == '1080p':
                 target_height = 1080
-                target_width = int((target_height / original_height) * original_width)
-                target_width = target_width - (target_width % 2)
-            elif target_resolution == '4k':
+            elif target_resolution == '4k' or target_resolution == '4K':
                 target_height = 2160
-                target_width = int((target_height / original_height) * original_width)
-                target_width = target_width - (target_width % 2)
             else:
                 # Default to 720p if invalid
                 target_height = 720
-                target_width = int((target_height / original_height) * original_width)
-                target_width = target_width - (target_width % 2)
+                
+            # Calculate width maintaining aspect ratio
+            target_width = int((target_height / original_height) * original_width)
+            # Ensure even dimensions (required by some codecs)
+            target_width = target_width - (target_width % 2)
+            target_height = target_height - (target_height % 2)
             
             # Update status
             job_status[job_id]['progress'] = 20
             
-            # Process video using OpenCV for basic upscaling
-            upscale_with_opencv(input_path, output_path, target_width, target_height, target_fps, job_id)
+            # Process video using FFmpeg
+            if check_ffmpeg():
+                # Use FFmpeg for better quality and frame interpolation
+                upscale_with_ffmpeg(input_path, output_path, target_width, target_height, 
+                                    original_fps, target_fps, job_id)
+            else:
+                # Fallback to OpenCV
+                upscale_with_opencv(input_path, output_path, target_width, target_height, 
+                                    original_fps, job_id)
             
             job_status[job_id]['status'] = 'completed'
             job_status[job_id]['progress'] = 100
@@ -84,19 +99,90 @@ def process_worker():
         finally:
             job_queue.task_done()
 
-# OpenCV-based upscaling
-def upscale_with_opencv(input_path, output_path, target_width, target_height, target_fps, job_id):
+# FFmpeg-based upscaling with frame interpolation
+def upscale_with_ffmpeg(input_path, output_path, target_width, target_height, 
+                        original_fps, target_fps, job_id):
+    # First pass - upscale the video without changing the framerate
+    temp_upscaled = os.path.join(TEMP_FOLDER, f"{job_id}_upscaled_temp.mp4")
+    
+    # Update progress
+    job_status[job_id]['progress'] = 25
+    
+    # Command for upscaling
+    upscale_cmd = [
+        'ffmpeg',
+        '-i', input_path,                         # Input file
+        '-vf', f'scale={target_width}:{target_height}',  # Scale filter
+        '-c:v', 'libx264',                        # Video codec
+        '-crf', '18',                             # Quality (lower is better)
+        '-preset', 'medium',                      # Encoding speed/quality balance
+        '-c:a', 'aac',                            # Audio codec
+        '-b:a', '128k',                           # Audio bitrate
+        '-y',                                     # Overwrite output
+        temp_upscaled                             # Output file
+    ]
+    
+    # Run the upscaling command
+    process = subprocess.Popen(upscale_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    
+    # Update progress while processing
+    while process.poll() is None:
+        time.sleep(1)  # Check status every second
+        job_status[job_id]['progress'] = min(50, job_status[job_id]['progress'] + 1)
+    
+    # Check if upscaling was successful
+    if process.returncode != 0:
+        stderr = process.stderr.read().decode()
+        raise Exception(f"FFmpeg upscaling failed: {stderr}")
+    
+    # Update progress
+    job_status[job_id]['progress'] = 50
+    
+    # Second pass - apply frame interpolation if target_fps > original_fps
+    if target_fps > original_fps:
+        # Command for frame interpolation
+        interpolate_cmd = [
+            'ffmpeg',
+            '-i', temp_upscaled,                  # Input file (upscaled)
+            '-filter_complex', f'minterpolate=fps={target_fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1',  # Frame interpolation
+            '-c:v', 'libx264',                    # Video codec
+            '-crf', '18',                         # Quality
+            '-preset', 'medium',                  # Encoding speed/quality balance
+            '-c:a', 'copy',                       # Copy audio stream
+            '-y',                                 # Overwrite output
+            output_path                           # Final output file
+        ]
+        
+        # Run the frame interpolation command
+        process = subprocess.Popen(interpolate_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        # Update progress while processing
+        while process.poll() is None:
+            time.sleep(1)  # Check status every second
+            job_status[job_id]['progress'] = min(95, job_status[job_id]['progress'] + 1)
+        
+        # Check if frame interpolation was successful
+        if process.returncode != 0:
+            stderr = process.stderr.read().decode()
+            raise Exception(f"FFmpeg frame interpolation failed: {stderr}")
+    else:
+        # If no frame interpolation needed, just copy the upscaled file
+        os.rename(temp_upscaled, output_path)
+        job_status[job_id]['progress'] = 95
+    
+    # Clean up temp file if it exists
+    if os.path.exists(temp_upscaled):
+        os.remove(temp_upscaled)
+
+# OpenCV-based upscaling fallback
+def upscale_with_opencv(input_path, output_path, target_width, target_height, original_fps, job_id):
     # Open the video
     video = cv2.VideoCapture(input_path)
-    original_fps = video.get(cv2.CAP_PROP_FPS)
     total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    # Set the target FPS
-    output_fps = target_fps if target_fps else original_fps
     
     # Create VideoWriter object
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # codec
-    out = cv2.VideoWriter(output_path, fourcc, output_fps, (target_width, target_height))
+    out = cv2.VideoWriter(output_path, fourcc, original_fps, (target_width, target_height))
     
     count = 0
     while True:
@@ -121,11 +207,8 @@ def upscale_with_opencv(input_path, output_path, target_width, target_height, ta
     video.release()
     out.release()
     
-    # Final processing (convert to mp4 with H.264 codec if needed)
+    # Final processing
     job_status[job_id]['progress'] = 95
-    
-    # If system has ffmpeg installed, we could use it here for better quality encoding
-    # But we'll keep it simple for now with just OpenCV
 
 # Start the worker thread
 worker_thread = Thread(target=process_worker, daemon=True)
@@ -269,6 +352,11 @@ def serve_template():
                 margin-bottom: 10px;
                 border-radius: 5px;
             }
+            .info-text {
+                color: #666;
+                font-size: 0.9em;
+                margin-top: 5px;
+            }
         </style>
     </head>
     <body>
@@ -295,6 +383,7 @@ def serve_template():
                         <option value="30">30 FPS</option>
                         <option value="60" selected>60 FPS</option>
                     </select>
+                    <p class="info-text">Higher FPS will create smoother video with frame interpolation.</p>
                 </div>
                 <button type="submit">Upload & Process</button>
             </form>
@@ -308,6 +397,13 @@ def serve_template():
         <script>
             // Store active jobs
             const activeJobs = {};
+            
+            // Check if FFmpeg is available
+            fetch('/status/check_ffmpeg')
+              .then(response => response.json())
+              .catch(() => {
+                console.log("Could not verify FFmpeg availability");
+              });
             
             document.getElementById('uploadForm').addEventListener('submit', async function(e) {
                 e.preventDefault();
@@ -415,6 +511,15 @@ def serve_template():
     </html>
     """
     return html_content
+
+# Endpoint to check if FFmpeg is available
+@app.route('/status/check_ffmpeg')
+def ffmpeg_status():
+    ffmpeg_available = check_ffmpeg()
+    return jsonify({
+        'ffmpeg_available': ffmpeg_available,
+        'message': 'FFmpeg is available' if ffmpeg_available else 'FFmpeg is not installed. Using OpenCV fallback.'
+    })
 
 if __name__ == '__main__':
     # Start the Flask app
