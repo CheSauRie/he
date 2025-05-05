@@ -2,3 +2,124 @@ ffmpeg -f lavfi -i testsrc=size=1280x720:rate=30 \
 -vf "drawtext=text='%{localtime\:%H\\\:%M\\\:%S.%{n*100/30}\}':fontcolor=white:fontsize=72:box=1:boxcolor=black@0.5:x=(w-text_w)/2:y=h-text_h-20, \
 drawtext=text='SOURCE':fontcolor=red:fontsize=72:box=1:boxcolor=black@0.5:x=(w-text_w)/2:y=100" \
 -c:v libx264 -preset ultrafast -tune zerolatency -f rtsp rtsp://127.0.0.1:8554/test
+
+package com.example.streaminfo.dto;
+
+import lombok.Data;
+
+@Data
+public class StreamInfo {
+    private String videoCodec;
+    private Integer videoBitrateKbps;
+    private Double framerate;
+    private Integer width;
+    private Integer height;
+    private String audioCodec;
+    private Integer audioBitrateKbps;
+}
+
+
+package com.example.streaminfo.service;
+
+import com.example.streaminfo.dto.StreamInfo;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+
+@Service
+@Slf4j
+public class StreamInfoService {
+
+    public StreamInfo getStreamInfo(String url) {
+        StreamInfo info = new StreamInfo();
+
+        try {
+            ProcessBuilder pb = new ProcessBuilder(
+                    "ffprobe", "-v", "error",
+                    "-show_entries", "stream=index,codec_name,bit_rate,avg_frame_rate,width,height",
+                    "-of", "default=noprint_wrappers=1:nokey=0",
+                    url
+            );
+
+            Process process = pb.start();
+            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+
+            String line;
+            int currentIndex = -1;
+
+            while ((line = reader.readLine()) != null) {
+                if (line.startsWith("index=")) {
+                    currentIndex = Integer.parseInt(line.replace("index=", "").trim());
+                } else if (line.startsWith("codec_name=")) {
+                    String codec = line.replace("codec_name=", "").trim();
+                    if (currentIndex == 0) info.setVideoCodec(codec);
+                    else if (currentIndex == 1) info.setAudioCodec(codec);
+                } else if (line.startsWith("bit_rate=")) {
+                    try {
+                        int bitrateKbps = Integer.parseInt(line.replace("bit_rate=", "").trim()) / 1000;
+                        if (currentIndex == 0) info.setVideoBitrateKbps(bitrateKbps);
+                        else if (currentIndex == 1) info.setAudioBitrateKbps(bitrateKbps);
+                    } catch (NumberFormatException ignored) {
+                        // bit_rate = N/A
+                    }
+                } else if (line.startsWith("avg_frame_rate=") && currentIndex == 0) {
+                    String[] parts = line.replace("avg_frame_rate=", "").split("/");
+                    if (parts.length == 2 && !parts[1].equals("0")) {
+                        try {
+                            double fps = Double.parseDouble(parts[0]) / Double.parseDouble(parts[1]);
+                            info.setFramerate(Math.round(fps * 100.0) / 100.0);
+                        } catch (NumberFormatException ignored) {}
+                    }
+                } else if (line.startsWith("width=") && currentIndex == 0) {
+                    info.setWidth(Integer.parseInt(line.replace("width=", "").trim()));
+                } else if (line.startsWith("height=") && currentIndex == 0) {
+                    info.setHeight(Integer.parseInt(line.replace("height=", "").trim()));
+                }
+            }
+
+            process.waitFor();
+
+        } catch (Exception e) {
+            log.error("Failed to extract stream info", e);
+        }
+
+        return info;
+    }
+}
+
+package com.example.streaminfo.controller;
+
+import com.example.streaminfo.dto.StreamInfo;
+import com.example.streaminfo.service.StreamInfoService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/stream")
+@RequiredArgsConstructor
+public class StreamInfoController {
+
+    private final StreamInfoService streamInfoService;
+
+    // GET method using query param: ?url=...
+    @GetMapping("/info")
+    public ResponseEntity<StreamInfo> getStreamInfo(@RequestParam String url) {
+        StreamInfo info = streamInfoService.getStreamInfo(url);
+        return ResponseEntity.ok(info);
+    }
+
+    // Optional: POST method using JSON body
+    @PostMapping("/info")
+    public ResponseEntity<StreamInfo> postStreamInfo(@RequestBody UrlRequest request) {
+        StreamInfo info = streamInfoService.getStreamInfo(request.getUrl());
+        return ResponseEntity.ok(info);
+    }
+
+    @Data
+    private static class UrlRequest {
+        private String url;
+    }
+}
